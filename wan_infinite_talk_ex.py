@@ -68,7 +68,7 @@ class WanInfiniteTalkToVideoEx(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, mode, model, model_patch, positive, negative, vae, width, height, length,
+    def execute(cls, mode, model, model_patch, positive, negative, vae, width, height, length, 
                 audio_encoder_output_1, motion_frame_count, audio_scale=1.0,
                 start_image=None, clip_vision_output=None, previous_frames=None,
                 audio_encoder_output_2=None, mask_1=None, mask_2=None,
