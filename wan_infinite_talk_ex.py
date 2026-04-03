@@ -54,6 +54,9 @@ class WanInfiniteTalkToVideoEx(io.ComfyNode):
                 io.Image.Input("previous_frames", optional=True),
                 # 新增的 audio_offset 输入
                 io.Int.Input("audio_offset", optional=True, default=None, min=0, max=nodes.MAX_RESOLUTION, tooltip="Audio start frame index (relative to full audio). If provided, overrides calculation from previous_frames length."),
+                # ====== ResNet 残差锚定：控制原始参考图对运动帧的潜空间修正强度 ======
+                io.Float.Input("ref_anchor_strength", default=0.0, min=0.0, max=1.0, step=0.01,
+                               tooltip="ResNet-style residual anchor strength. Blends motion_frames_latent toward the reference image latent in latent space. 0.0 = off (original behavior), 0.15~0.25 = recommended range to reduce drift without stiffening motion."),
             ],
             outputs=[
                 io.Model.Output(display_name="model"),
@@ -65,11 +68,12 @@ class WanInfiniteTalkToVideoEx(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, mode, model, model_patch, positive, negative, vae, width, height, length, 
+    def execute(cls, mode, model, model_patch, positive, negative, vae, width, height, length,
                 audio_encoder_output_1, motion_frame_count, audio_scale=1.0,
                 start_image=None, clip_vision_output=None, previous_frames=None,
                 audio_encoder_output_2=None, mask_1=None, mask_2=None,
-                audio_offset=None):   # 新增参数
+                audio_offset=None,
+                ref_anchor_strength=0.0):   # ResNet 残差锚定强度
         """执行逻辑与原始节点基本相同，但音频起始位置优先使用 audio_offset"""
 
         # 处理模式选择（同原始代码）
@@ -163,6 +167,24 @@ class WanInfiniteTalkToVideoEx(io.ComfyNode):
 
             motion_frames_latent = vae.encode(motion_frames[:, :, :, :3])
             trim_image = motion_frame_count
+
+            # ====== ResNet 残差锚定：将 motion_frames_latent 向原始参考图的潜空间表示拉回 ======
+            # 原理：类似 ResNet 的跳跃连接，motion_frames_latent = (1-α) * motion + α * ref
+            # 这保证了无论循环多少轮，运动帧的潜空间表示都不会偏离原始参考图太远
+            if ref_anchor_strength > 0.0 and start_image is not None:
+                # 取原始参考图的第一帧，缩放到目标尺寸
+                ref_frame = start_image[:1]  # [1, H, W, C]
+                ref_frame_scaled = comfy.utils.common_upscale(
+                    ref_frame.movedim(-1, 1), width, height, "bilinear", "center"
+                ).movedim(1, -1)
+                # 复制到与 motion_frames 相同的帧数
+                ref_frames_batch = ref_frame_scaled.repeat(motion_frames.shape[0], 1, 1, 1)
+                # 编码到潜空间
+                ref_latent = vae.encode(ref_frames_batch[:, :, :, :3])
+                # 潜空间残差混合
+                alpha = ref_anchor_strength
+                motion_frames_latent = (1.0 - alpha) * motion_frames_latent + alpha * ref_latent
+                logging.info(f"InfiniteTalkEx: ResNet anchor applied, strength={alpha:.2f}")
         else:
             audio_start = trim_image = 0
             audio_end = length
