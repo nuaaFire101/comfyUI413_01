@@ -10,6 +10,7 @@ from .debugMemoryNode import DebugMemoryNode
 from .wan_infinite_talk_ex import WanInfiniteTalkToVideoEx
 from .lolo_video_save_output import LoloVideoSaveOutput
 from .lolo_clear_cache import LoLolClearCache, LoLolClearCacheWithLabel
+from .lolo_color_match import LoloColorMatch
 
      
 import os
@@ -27,7 +28,8 @@ NODE_CLASS_MAPPINGS = {
     "WanInfiniteTalkToVideoEx": WanInfiniteTalkToVideoEx,
     "LoloVideoSaveOutput": LoloVideoSaveOutput,
     "LoLolClearCache": LoLolClearCache,
-    "LoLolClearCacheWithLabel": LoLolClearCacheWithLabel
+    "LoLolClearCacheWithLabel": LoLolClearCacheWithLabel,
+    "LoloColorMatch": LoloColorMatch
 }
 
 # 节点显示名称映射
@@ -44,7 +46,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "WanInfiniteTalkToVideoEx": "Wan Infinite Talk To Video (Extended)",
     "LoloVideoSaveOutput" : "Lolo Video Save Output",
     "LoLolClearCache": "LoLo: Clear Cache",
-    "LoLolClearCacheWithLabel": "LoLo: Clear Cache (Labeled)"
+    "LoLolClearCacheWithLabel": "LoLo: Clear Cache (Labeled)",
+    "LoloColorMatch": "LoLo: Color Match"
 
 }
 
