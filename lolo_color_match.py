@@ -8,12 +8,12 @@ logger = logging.getLogger("LoloColorMatch")
 class LoloColorMatch:
     """
     色彩校正节点：将生成的视频帧的色彩分布向参考图像对齐。
-    
+
     原理：
     使用 Reinhard 色彩迁移算法，在 LAB 色彩空间中将生成帧的
     均值和标准差对齐到参考图像。这能有效解决生成视频中
     面部惨白、色彩偏移等问题，同时保持画面的自然过渡。
-    
+
     用法：
     将此节点插入 VAEDecode 之后、VideoSaveOutput 之前。
     - reference_image: 接入原始参考图（和 start_image 相同）
@@ -180,14 +180,26 @@ class LoloColorMatch:
 
     def color_match(self, images, reference_image, strength=0.7, mode="reinhard_lab", mask=None):
         """
-        对批量图像进行色彩校正。
+        对批量图像进行色彩校正。（内存优化版：逐帧处理 + 原地写入）
         """
+        import gc
+
         if strength == 0.0:
             return (images,)
 
-        # 转 numpy
-        images_np = images.cpu().numpy()  # [B, H, W, C]
-        ref_np = reference_image[0].cpu().numpy()  # 取第一帧作为参考 [H, W, C]
+        # 只转换参考图到 numpy（很小，只有1帧）
+        ref_np = reference_image[0].cpu().numpy()  # [H, W, C]
+
+        # 预处理 mask（只做一次）
+        mask_3d = None
+        if mask is not None:
+            mask_np = mask[0].cpu().numpy()
+            if mask_np.shape != (images.shape[1], images.shape[2]):
+                from PIL import Image as PILImage
+                mask_pil = PILImage.fromarray((mask_np * 255).astype(np.uint8))
+                mask_pil = mask_pil.resize((images.shape[2], images.shape[1]), PILImage.BILINEAR)
+                mask_np = np.array(mask_pil).astype(np.float32) / 255.0
+            mask_3d = mask_np[..., np.newaxis]
 
         # 选择算法
         match_fn = {
@@ -196,31 +208,23 @@ class LoloColorMatch:
             "histogram_match": self._histogram_match,
         }[mode]
 
-        batch_size = images_np.shape[0]
-        result = np.zeros_like(images_np)
+        batch_size = images.shape[0]
 
+        # 逐帧处理，避免同时持有整个批次的两份副本
+        result_frames = []
         for i in range(batch_size):
-            corrected = match_fn(images_np[i], ref_np, strength).astype(np.float32)
+            frame_np = images[i].cpu().numpy()  # 单帧 ~6.8 MB
+            corrected = match_fn(frame_np, ref_np, strength).astype(np.float32)
 
-            # 如果有 mask，只在 mask 区域应用校正
-            if mask is not None:
-                mask_np = mask[0].cpu().numpy()  # [H, W]
-                # 确保 mask 尺寸匹配
-                if mask_np.shape != images_np[i].shape[:2]:
-                    from PIL import Image
-                    mask_pil = Image.fromarray((mask_np * 255).astype(np.uint8))
-                    mask_pil = mask_pil.resize(
-                        (images_np[i].shape[1], images_np[i].shape[0]),
-                        Image.BILINEAR
-                    )
-                    mask_np = np.array(mask_pil).astype(np.float32) / 255.0
+            if mask_3d is not None:
+                corrected = frame_np * (1 - mask_3d) + corrected * mask_3d
 
-                mask_3d = mask_np[..., np.newaxis]  # [H, W, 1]
-                corrected = images_np[i] * (1 - mask_3d) + corrected * mask_3d
+            result_frames.append(torch.from_numpy(corrected))
+            del frame_np, corrected  # 立即释放
 
-            result[i] = corrected
-
-        result_tensor = torch.from_numpy(result).to(images.device, dtype=images.dtype)
+        result_tensor = torch.stack(result_frames).to(images.device, dtype=images.dtype)
+        del result_frames
+        gc.collect()
 
         logger.info(
             f"[LoloColorMatch] 已对 {batch_size} 帧进行色彩校正 "

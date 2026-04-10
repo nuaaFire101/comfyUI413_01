@@ -1,4 +1,5 @@
 import torch
+import gc
 import comfy.model_management
 import comfy.utils
 import logging
@@ -68,7 +69,7 @@ class WanInfiniteTalkToVideoEx(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, mode, model, model_patch, positive, negative, vae, width, height, length, 
+    def execute(cls, mode, model, model_patch, positive, negative, vae, width, height, length,
                 audio_encoder_output_1, motion_frame_count, audio_scale=1.0,
                 start_image=None, clip_vision_output=None, previous_frames=None,
                 audio_encoder_output_2=None, mask_1=None, mask_2=None,
@@ -91,13 +92,14 @@ class WanInfiniteTalkToVideoEx(io.ComfyNode):
                 raise ValueError("Second audio encoder output must be provided if two masks are used.")
             ref_masks = torch.cat([mask_1, mask_2])
 
-        # 处理 start_image（同原始代码）
+        # 处理 start_image（优化内存：编码后立即释放大张量）
         concat_latent_image = None
         if start_image is not None:
             start_image = comfy.utils.common_upscale(start_image[:length].movedim(-1, 1), width, height, "bilinear", "center").movedim(1, -1)
             image = torch.ones((length, height, width, start_image.shape[-1]), device=start_image.device, dtype=start_image.dtype) * 0.5
             image[:start_image.shape[0]] = start_image
             concat_latent_image = vae.encode(image[:, :, :, :3])
+            del image  # 释放 ~735 MB
             concat_mask = torch.ones((1, 1, ((length-1)//4)+1, concat_latent_image.shape[-2], concat_latent_image.shape[-1]), device=start_image.device, dtype=start_image.dtype)
             concat_mask[:, :, :((start_image.shape[0] - 1) // 4) + 1] = 0.0
             positive = node_helpers.conditioning_set_values(positive, {"concat_latent_image": concat_latent_image, "concat_mask": concat_mask})
@@ -179,12 +181,19 @@ class WanInfiniteTalkToVideoEx(io.ComfyNode):
                 ).movedim(1, -1)
                 # 复制到与 motion_frames 相同的帧数
                 ref_frames_batch = ref_frame_scaled.repeat(motion_frames.shape[0], 1, 1, 1)
+                del ref_frame, ref_frame_scaled  # 立即释放
                 # 编码到潜空间
                 ref_latent = vae.encode(ref_frames_batch[:, :, :, :3])
-                # 潜空间残差混合
+                del ref_frames_batch  # 释放 ~60 MB
+                # 潜空间残差混合（原地操作，避免创建新张量）
                 alpha = ref_anchor_strength
-                motion_frames_latent = (1.0 - alpha) * motion_frames_latent + alpha * ref_latent
+                motion_frames_latent.mul_(1.0 - alpha).add_(ref_latent, alpha=alpha)
+                del ref_latent
                 logging.info(f"InfiniteTalkEx: ResNet anchor applied, strength={alpha:.2f}")
+
+            # 释放不再需要的运动帧像素数据
+            del motion_frames
+            gc.collect()
         else:
             audio_start = trim_image = 0
             audio_end = length

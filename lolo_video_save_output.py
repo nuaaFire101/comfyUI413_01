@@ -1,10 +1,12 @@
 import os
+import gc
 import subprocess
 import re
 import torch
 import numpy as np
 import folder_paths
 from .lolo_ffmpeg_utils import get_ffmpeg_path
+
 
 class LoloVideoSaveOutput:
     @classmethod
@@ -30,7 +32,9 @@ class LoloVideoSaveOutput:
         # 检查输入批次是否为空
         if images.shape[0] == 0:
             print("[LoloVideoSaveOutput] 警告：输入的 images 批次为空，跳过视频保存。")
-            return (torch.zeros((0, images.shape[1], images.shape[2], images.shape[3])) if images.ndim == 4 else torch.zeros((0,0,0,0)),)
+            return (torch.zeros(
+                (0, images.shape[1], images.shape[2], images.shape[3])) if images.ndim == 4 else torch.zeros(
+                (0, 0, 0, 0)),)
 
         batch_size, height, width, channels = images.shape
         if channels != 3:
@@ -52,20 +56,24 @@ class LoloVideoSaveOutput:
         output_file, next_counter = self._get_next_available_filename(full_output_folder, base_filename, format)
         print(f"[LoloVideoSaveOutput] 正在保存视频到: {output_file}")
 
-        # 转换图像并编码
+        # 转换图像并编码（优化内存：用完立即释放大数组）
         try:
             images_np = (images.cpu().numpy() * 255).astype(np.uint8)
             self._encode_with_ffmpeg(images_np, output_file, fps, format, codec)
+            del images_np  # 立即释放 numpy 副本，~735 MB
         except Exception as e:
             print(f"[LoloVideoSaveOutput] 视频编码失败: {e}")
             raise e
 
-        # 提取尾部帧
+        # 提取尾部帧（先提取再释放原始大张量）
         last_count = min(output_last_frame_count, batch_size)
         if last_count > 0:
-            last_frames = images[-last_count:]
+            last_frames = images[-last_count:].clone()  # clone 确保独立于原张量
         else:
             last_frames = torch.zeros((0, height, width, channels))
+
+        del images  # 释放原始 109 帧张量，~735 MB
+        gc.collect()
 
         return (last_frames,)
 
@@ -107,12 +115,13 @@ class LoloVideoSaveOutput:
 
         # 将所有图像数据合并为一个 bytes 对象
         raw_data = images_np.tobytes()
-        
+
         proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         stdout, stderr = proc.communicate(input=raw_data)
-        
+
         if proc.returncode != 0:
-            raise RuntimeError(f"ffmpeg 编码失败 (返回码 {proc.returncode}):\n{stderr.decode('utf-8', errors='ignore')}")
+            raise RuntimeError(
+                f"ffmpeg 编码失败 (返回码 {proc.returncode}):\n{stderr.decode('utf-8', errors='ignore')}")
 
         if not os.path.exists(output_file):
             raise RuntimeError(f"ffmpeg 执行成功但未生成输出文件: {output_file}")
