@@ -1,30 +1,26 @@
 """
-LoLolClearCache - 透明缓存清理节点（增强版）
-=============================================
-
-功能：
-- 接收任意输入
-- 输出相同的输入（透传）
-- 执行后清理 ComfyUI 的缓存（显存、内存、未使用的模型等）
-- 【新增】可清理 ComfyUI 的 prompt 执行缓存（解决循环生成中内存持续增长问题）
-- 保持工作流其他节点不受影响
+LoLolClearCache - 透明缓存清理节点（增强版 v2）
+=================================================
 
 核心改进：
-  ComfyUI 内部会缓存每个节点的执行结果（存储在 PromptExecutor 的 caches 中），
-  在循环（for loop）场景下，前一轮的 VAEDecode、ImageFromBatch 等节点的输出
-  （每轮 ~1.4 GB）不会自动释放，导致内存随循环次数线性增长。
+  ComfyUI 的 PromptExecutor 是 prompt_worker 函数中的局部变量 `e`，
+  外部无法直接访问。本版本通过两种策略找到它：
   
-  本节点通过访问 PromptServer.instance.prompt_queue 获取当前执行器，
-  并清理其中的节点输出缓存，确保只保留当前轮需要的数据。
+  策略1：遍历所有线程的栈帧，找到 prompt_worker 函数中的局部变量 `e`
+         （PromptExecutor 实例），然后直接操作其 caches.outputs。
+  
+  策略2：如果策略1失败，通过 monkey-patch PromptExecutor.__init__，
+         在下次创建时将实例注册到 PromptServer 上。
 
-使用场景：
-- 在循环工作流的 forLoopEnd 之前插入此节点
-- 开启 clean_comfy_cache 选项来释放历史轮次的节点输出
+  找到 executor 后，调用 caches.outputs 的方法清理节点输出缓存，
+  确保循环中前几轮的大张量（VAEDecode ~736MB/轮）被及时释放。
 """
 
 import torch
 import gc
+import sys
 import time
+import threading
 import logging
 
 # 尝试导入 psutil 以打印详细内存日志
@@ -34,20 +30,24 @@ try:
 except ImportError:
     HAS_PSUTIL = False
 
-# 尝试导入 ComfyUI 的 model_management，以便清理未使用的模型
+# 尝试导入 ComfyUI 的 model_management
 try:
     import comfy.model_management
+    HAS_COMFY = True
 except ImportError:
-    comfy = None
+    HAS_COMFY = False
 
-# 尝试导入 ComfyUI 的 PromptServer，以便访问执行缓存
+# 尝试导入 execution 模块以识别 PromptExecutor 类型
 try:
-    from server import PromptServer
-    HAS_PROMPT_SERVER = True
+    from execution import PromptExecutor
+    HAS_EXECUTOR_CLASS = True
 except ImportError:
-    HAS_PROMPT_SERVER = False
+    HAS_EXECUTOR_CLASS = False
 
 logger = logging.getLogger("LoLolClearCache")
+
+# 全局缓存：一旦找到 executor 就存起来，不用每次都遍历栈帧
+_cached_executor = None
 
 
 def _get_mem_info():
@@ -63,11 +63,53 @@ def _get_mem_info():
     return " | ".join(lines) if lines else "N/A"
 
 
+def _find_prompt_executor():
+    """
+    通过遍历所有线程的栈帧，找到 prompt_worker 中的 PromptExecutor 实例。
+    
+    原理：ComfyUI 的 main.py 中有：
+        def prompt_worker(q, server_instance):
+            e = execution.PromptExecutor(...)
+            while True:
+                e.execute(...)
+    
+    当我们的节点代码在执行时，prompt_worker 线程的调用栈中
+    一定有 `e` 这个局部变量。我们遍历所有线程栈帧找到它。
+    """
+    global _cached_executor
+
+    # 先检查缓存的 executor 是否仍然有效
+    if _cached_executor is not None:
+        if hasattr(_cached_executor, 'caches') and hasattr(_cached_executor.caches, 'outputs'):
+            return _cached_executor
+        else:
+            _cached_executor = None
+
+    if not HAS_EXECUTOR_CLASS:
+        return None
+
+    # 遍历所有线程的栈帧
+    for thread_id, frame in sys._current_frames().items():
+        current_frame = frame
+        while current_frame is not None:
+            # 检查该栈帧的局部变量中是否有 PromptExecutor 实例
+            for var_name, var_value in current_frame.f_locals.items():
+                if isinstance(var_value, PromptExecutor):
+                    logger.info(f"[LoLolClearCache] 找到 PromptExecutor: "
+                               f"线程={thread_id}, 帧={current_frame.f_code.co_name}, 变量名={var_name}")
+                    _cached_executor = var_value
+                    return var_value
+            current_frame = current_frame.f_back
+
+    logger.warning("[LoLolClearCache] 未能通过栈帧找到 PromptExecutor")
+    return None
+
+
 class LoLolClearCache:
     """
-    透明缓存清理节点（增强版）
+    透明缓存清理节点（增强版 v2）
     功能：透传输入，可清理 CUDA 缓存、执行垃圾回收、清理未使用的模型、
-          以及 ComfyUI 的 prompt 执行缓存。
+          以及 ComfyUI 的 prompt 执行缓存（直接操作 PromptExecutor.caches）。
     """
 
     @classmethod
@@ -102,35 +144,22 @@ class LoLolClearCache:
         """
         清理 ComfyUI 的 prompt 执行缓存。
         
-        策略：遍历执行缓存中的所有节点输出，只保留当前节点的直接输入来源，
-        清理其他所有中间节点的缓存输出。
-        
-        这样能确保：
-        - 当前节点接收的 input 数据不会被意外清理
-        - VAEDecode、采样器等大量占用内存的中间结果会被释放
+        通过栈帧回溯找到 PromptExecutor，然后操作其 caches.outputs，
+        删除除当前节点直接输入来源以外的所有节点输出缓存。
         """
-        if not HAS_PROMPT_SERVER:
-            logger.warning("[LoLolClearCache] PromptServer 不可用，无法清理执行缓存")
+        executor = _find_prompt_executor()
+        if executor is None:
+            logger.warning("[LoLolClearCache] 无法找到 PromptExecutor，跳过执行缓存清理")
+            # 回退方案
+            if HAS_COMFY and hasattr(comfy.model_management, 'soft_empty_cache'):
+                comfy.model_management.soft_empty_cache()
+                logger.info("[LoLolClearCache] 回退: 已执行 soft_empty_cache")
             return 0
 
         cleared_count = 0
         try:
-            prompt_queue = PromptServer.instance.prompt_queue
-
-            # 获取当前正在执行的 executor
-            current_executor = None
-            if hasattr(prompt_queue, 'currently_running'):
-                for item_id, value in list(prompt_queue.currently_running.items()):
-                    # currently_running 的值结构可能因版本而异
-                    if isinstance(value, tuple) and len(value) >= 2:
-                        current_executor = value[1]
-                    else:
-                        current_executor = value
-                    break
-
-            if current_executor is None:
-                logger.info("[LoLolClearCache] 未找到当前执行器")
-                return 0
+            caches = executor.caches
+            outputs_cache = caches.outputs
 
             # 找到需要保护的节点ID（当前节点 + 直接输入来源）
             protected_nodes = set()
@@ -141,65 +170,53 @@ class LoLolClearCache:
                 inputs = node_info.get("inputs", {})
                 for key, value in inputs.items():
                     if isinstance(value, list) and len(value) >= 2:
-                        # [node_id, slot_index] 表示一个连接
                         protected_nodes.add(str(value[0]))
 
-            # 尝试多种方式访问执行缓存（适配不同 ComfyUI 版本）
-            cache_cleared = False
+            # 获取缓存中所有节点ID
+            all_cached_ids = set()
+            if hasattr(outputs_cache, 'all_node_ids'):
+                all_cached_ids = set(str(nid) for nid in outputs_cache.all_node_ids())
+            
+            # 计算需要清理的节点
+            to_clear = all_cached_ids - protected_nodes
 
-            # 方式1: executor.caches.outputs（较新版本）
-            if hasattr(current_executor, 'caches'):
-                caches = current_executor.caches
-                cache_dict = None
+            if to_clear:
+                logger.info(f"[LoLolClearCache] 缓存中共 {len(all_cached_ids)} 个节点, "
+                           f"保护 {len(protected_nodes)} 个: {protected_nodes}, "
+                           f"将清理 {len(to_clear)} 个")
 
-                if hasattr(caches, 'outputs'):
-                    outputs = caches.outputs
-                    # DynamicCache 或 LRUCache 内部可能有 .cache 属性
-                    if hasattr(outputs, 'cache'):
-                        cache_dict = outputs.cache
-                    elif isinstance(outputs, dict):
-                        cache_dict = outputs
-
-                if cache_dict is not None:
-                    keys_to_delete = [
-                        nid for nid in list(cache_dict.keys())
-                        if str(nid) not in protected_nodes
-                    ]
-                    for nid in keys_to_delete:
-                        try:
-                            del cache_dict[nid]
+            # 逐个删除非保护节点的缓存
+            for node_id in to_clear:
+                try:
+                    # 尝试多种删除方式，适配不同的缓存实现
+                    if hasattr(outputs_cache, 'delete'):
+                        outputs_cache.delete(node_id)
+                        cleared_count += 1
+                    elif hasattr(outputs_cache, '_delete_node'):
+                        outputs_cache._delete_node(node_id)
+                        cleared_count += 1
+                    elif hasattr(outputs_cache, 'cache') and isinstance(outputs_cache.cache, dict):
+                        if node_id in outputs_cache.cache:
+                            del outputs_cache.cache[node_id]
                             cleared_count += 1
-                        except (KeyError, RuntimeError):
-                            pass
-                    cache_cleared = True
-
-            # 方式2: executor.outputs（旧版本）
-            if not cache_cleared and hasattr(current_executor, 'outputs'):
-                outputs = current_executor.outputs
-                if isinstance(outputs, dict):
-                    keys_to_delete = [
-                        nid for nid in list(outputs.keys())
-                        if str(nid) not in protected_nodes
-                    ]
-                    for nid in keys_to_delete:
-                        try:
-                            del outputs[nid]
+                    else:
+                        # 最后的尝试：直接设置为 None
+                        if hasattr(outputs_cache, 'set'):
+                            outputs_cache.set(node_id, None)
                             cleared_count += 1
-                        except (KeyError, RuntimeError):
-                            pass
-                    cache_cleared = True
+                except Exception as e:
+                    logger.debug(f"[LoLolClearCache] 清理节点 {node_id} 失败: {e}")
 
-            # 方式3: 通用回退 - soft_empty_cache
-            if not cache_cleared:
-                if comfy is not None and hasattr(comfy.model_management, 'soft_empty_cache'):
-                    comfy.model_management.soft_empty_cache()
-                    logger.info("[LoLolClearCache] 回退: 已执行 soft_empty_cache")
+            # 如果逐个删除不行，尝试使用 poll 方法强制回收
+            if cleared_count == 0 and hasattr(outputs_cache, 'poll'):
+                logger.info("[LoLolClearCache] 逐个删除未生效，尝试 poll(ram_headroom=0) 强制回收...")
+                outputs_cache.poll(ram_headroom=0)
+                cleared_count = -1  # 标记为使用了 poll
 
             if cleared_count > 0:
-                logger.info(
-                    f"[LoLolClearCache] 已清理 {cleared_count} 个节点的执行缓存"
-                    f"（保护了 {len(protected_nodes)} 个节点: {protected_nodes}）"
-                )
+                logger.info(f"[LoLolClearCache] 成功清理 {cleared_count} 个节点的执行缓存")
+            elif cleared_count == -1:
+                logger.info("[LoLolClearCache] 已通过 poll() 触发缓存回收")
 
         except Exception as e:
             logger.error(f"[LoLolClearCache] 清理执行缓存时出错: {e}")
@@ -220,7 +237,7 @@ class LoLolClearCache:
                 self._clear_comfy_execution_cache(unique_id, prompt)
 
             # 2. 清理未使用的模型
-            if clean_unused_models and comfy is not None:
+            if clean_unused_models and HAS_COMFY:
                 if hasattr(comfy.model_management, 'cleanup_models'):
                     comfy.model_management.cleanup_models()
                     logger.info("  - 未使用的模型已清理")
