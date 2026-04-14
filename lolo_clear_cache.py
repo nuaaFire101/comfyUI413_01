@@ -1,15 +1,15 @@
 """
-LoLolClearCache - 透明缓存清理节点（增强版 v4）
+LoLolClearCache - 透明缓存清理节点（增强版 v5）
 =================================================
 
-v4 改进：
-  v3 清理太彻底，把 LoloGenerateFilename、SetNode 等轻量节点的缓存也删了，
-  导致每轮循环重新生成文件名 → 每段视频创建新文件夹。
-  
-  v4 改为「白名单清理」策略：
-  只清理已知的大内存节点（VAEDecode、采样器、ImageFromBatch 等），
-  保留所有轻量节点的缓存。用户可以通过 heavy_node_types 参数自定义
-  需要清理的节点类型。
+v5 改进：
+  v4 只能清理 depth=0 层的大内存节点，因为在递归进入 subcache 后
+  用顶层 prompt 的 node_id 无法匹配 subcache 内部的 cache_key。
+
+  v5 的做法：在每一层 subcache 中，通过 cache_key_set.keys 字典
+  获取该层所有注册的 node_id，再从 dynprompt 查询其 class_type，
+  判断是否属于大内存节点类型，然后用 get_data_key 获取正确的
+  cache_key 去删除。这样无论循环嵌套多深都能正确清理。
 """
 
 import torch
@@ -20,18 +20,21 @@ import logging
 
 try:
     import psutil
+
     HAS_PSUTIL = True
 except ImportError:
     HAS_PSUTIL = False
 
 try:
     import comfy.model_management
+
     HAS_COMFY = True
 except ImportError:
     HAS_COMFY = False
 
 try:
     from execution import PromptExecutor
+
     HAS_EXECUTOR_CLASS = True
 except ImportError:
     HAS_EXECUTOR_CLASS = False
@@ -41,24 +44,17 @@ logger = logging.getLogger("LoLolClearCache")
 _cached_executor = None
 
 # 默认需要清理的大内存节点类型
-# 这些节点的输出是大张量（数百MB~数GB），必须在循环中及时释放
 DEFAULT_HEAVY_NODE_TYPES = {
-    # VAE 解码输出（109帧 × 1024×576×3 × float32 ≈ 736 MB）
     "VAEDecode",
     "VAEDecodeTiled",
-    # 采样器输出（latent 也不小）
     "KSampler",
     "KSamplerAdvanced",
     "SamplerCustom",
     "SamplerCustomAdvanced",
-    # 图像处理
     "ImageFromBatch",
     "ImageBatch",
-    # 视频保存（内部已做清理但缓存仍会保留引用）
     "LoloVideoSaveOutput",
-    # 色彩校正
     "LoloColorMatch",
-    # Wan 视频生成（条件和模型补丁，单个不大但包含大量引用）
     "WanInfiniteTalkToVideo",
     "WanInfiniteTalkToVideoEx",
 }
@@ -69,10 +65,10 @@ def _get_mem_info():
     lines = []
     if HAS_PSUTIL:
         mem = psutil.virtual_memory()
-        lines.append(f"RAM: {mem.used/1024**3:.2f}/{mem.total/1024**3:.2f} GB ({mem.percent:.1f}%)")
+        lines.append(f"RAM: {mem.used / 1024 ** 3:.2f}/{mem.total / 1024 ** 3:.2f} GB ({mem.percent:.1f}%)")
     if torch.cuda.is_available():
-        allocated = torch.cuda.memory_allocated() / 1024**3
-        reserved = torch.cuda.memory_reserved() / 1024**3
+        allocated = torch.cuda.memory_allocated() / 1024 ** 3
+        reserved = torch.cuda.memory_reserved() / 1024 ** 3
         lines.append(f"VRAM: alloc {allocated:.2f} GB, reserved {reserved:.2f} GB")
     return " | ".join(lines) if lines else "N/A"
 
@@ -105,89 +101,105 @@ def _find_prompt_executor():
     return None
 
 
-def _get_heavy_node_ids(prompt, heavy_types):
+def _find_heavy_keys_in_cache(cache_obj, heavy_types):
     """
-    从 prompt 中找出所有属于大内存类型的节点ID。
-    
-    参数：
-        prompt: ComfyUI 的 prompt 字典 {node_id: {class_type, inputs, ...}}
-        heavy_types: 需要清理的节点类型集合
-    
-    返回：
-        set: 需要清理的节点ID集合
+    在当前缓存层级中找到属于大内存类型的 cache_key 列表。
+
+    通过 cache_key_set.subcache_keys 获取 (node_id, class_type) 映射，
+    或通过 cache_key_set.keys 获取 node_id 然后查 dynprompt。
+
+    返回: 需要删除的 cache_key 列表
     """
-    heavy_ids = set()
-    if not prompt:
-        return heavy_ids
+    keys_to_delete = []
 
-    for node_id, node_info in prompt.items():
-        class_type = node_info.get("class_type", "")
-        if class_type in heavy_types:
-            heavy_ids.add(str(node_id))
+    if not hasattr(cache_obj, 'cache_key_set') or not hasattr(cache_obj, 'cache'):
+        return keys_to_delete
 
-    return heavy_ids
+    cache_key_set = cache_obj.cache_key_set
+
+    # 方法1: 通过 subcache_keys 获取 class_type（最可靠）
+    # subcache_keys 的值是 (node_id, class_type)
+    if hasattr(cache_key_set, 'subcache_keys'):
+        node_to_class = {}
+        for node_id, subcache_key_val in cache_key_set.subcache_keys.items():
+            if isinstance(subcache_key_val, tuple) and len(subcache_key_val) >= 2:
+                node_to_class[node_id] = subcache_key_val[1]  # class_type
+
+        # 对于在 subcache_keys 中找到 class_type 的节点
+        for node_id, class_type in node_to_class.items():
+            if class_type in heavy_types:
+                cache_key = cache_key_set.get_data_key(node_id)
+                if cache_key is not None and cache_key in cache_obj.cache:
+                    keys_to_delete.append((cache_key, node_id, class_type))
+
+    # 方法2: 对于在 keys 中注册但不在 subcache_keys 中的节点，
+    # 尝试通过 dynprompt 查 class_type
+    if hasattr(cache_key_set, 'keys') and hasattr(cache_obj, 'dynprompt'):
+        dynprompt = cache_obj.dynprompt
+        for node_id in cache_key_set.keys:
+            # 跳过已处理的
+            cache_key = cache_key_set.get_data_key(node_id)
+            if cache_key is None or cache_key not in cache_obj.cache:
+                continue
+            # 检查是否已在 keys_to_delete 中
+            if any(k[0] == cache_key for k in keys_to_delete):
+                continue
+
+            try:
+                if hasattr(dynprompt, 'has_node') and dynprompt.has_node(node_id):
+                    node = dynprompt.get_node(node_id)
+                    class_type = node.get("class_type", "")
+                    if class_type in heavy_types:
+                        keys_to_delete.append((cache_key, node_id, class_type))
+            except Exception:
+                pass
+
+    return keys_to_delete
 
 
-def _selective_clear_cache(cache_obj, heavy_node_ids, prompt, depth=0):
+def _recursive_selective_clear(cache_obj, heavy_types, depth=0):
     """
-    选择性清理缓存：只删除大内存节点的缓存条目，保留轻量节点。
-    同时递归处理 subcaches（for-loop 的历史轮次）。
-    
-    参数：
-        cache_obj: BasicCache 或其子类实例
-        heavy_node_ids: 需要清理的节点ID集合
-        prompt: ComfyUI 的 prompt 字典
-        depth: 递归深度
-    
-    返回：
-        (cleared_count, total_count)
+    递归遍历缓存层级，在每一层中：
+    1. 找到属于大内存类型的 cache_key 并删除
+    2. 清理历史 subcache（for-loop 的旧轮次）
+    3. 递归进入剩余的 subcache 继续清理
+
+    返回: (cleared_count, total_count)
     """
     cleared = 0
     total = 0
     prefix = "  " * depth
 
-    # 清理当前层级的 cache 字典中属于大内存节点的条目
-    if hasattr(cache_obj, 'cache') and isinstance(cache_obj.cache, dict) and \
-       hasattr(cache_obj, 'cache_key_set'):
-        keys_to_delete = []
+    # 步骤1: 在当前层级清理大内存节点的缓存
+    if hasattr(cache_obj, 'cache') and isinstance(cache_obj.cache, dict):
+        total += len(cache_obj.cache)
 
-        for cache_key in list(cache_obj.cache.keys()):
-            total += 1
-            # 检查这个 cache_key 是否对应一个大内存节点
-            should_delete = False
-            for node_id in heavy_node_ids:
-                try:
-                    node_cache_key = cache_obj.cache_key_set.get_data_key(node_id)
-                    if node_cache_key == cache_key:
-                        should_delete = True
-                        break
-                except Exception:
-                    pass
+        heavy_keys = _find_heavy_keys_in_cache(cache_obj, heavy_types)
 
-            if should_delete:
-                keys_to_delete.append(cache_key)
-
-        for key in keys_to_delete:
+        for cache_key, node_id, class_type in heavy_keys:
             try:
-                del cache_obj.cache[key]
+                del cache_obj.cache[cache_key]
                 cleared += 1
-                if hasattr(cache_obj, 'used_generation') and key in cache_obj.used_generation:
-                    del cache_obj.used_generation[key]
-                if hasattr(cache_obj, 'timestamps') and key in cache_obj.timestamps:
-                    del cache_obj.timestamps[key]
-                if hasattr(cache_obj, 'children') and key in cache_obj.children:
-                    del cache_obj.children[key]
+                # 清理辅助字典
+                if hasattr(cache_obj, 'used_generation') and cache_key in cache_obj.used_generation:
+                    del cache_obj.used_generation[cache_key]
+                if hasattr(cache_obj, 'timestamps') and cache_key in cache_obj.timestamps:
+                    del cache_obj.timestamps[cache_key]
+                if hasattr(cache_obj, 'children') and cache_key in cache_obj.children:
+                    del cache_obj.children[cache_key]
             except Exception as e:
-                logger.debug(f"{prefix}删除 cache key 失败: {e}")
+                logger.debug(f"{prefix}删除失败 node={node_id} type={class_type}: {e}")
 
-        if keys_to_delete:
-            logger.info(f"{prefix}[depth={depth}] 选择性清理了 {len(keys_to_delete)}/{total} 个大内存缓存条目")
+        if heavy_keys:
+            logger.info(f"{prefix}[depth={depth}] 清理了 {len(heavy_keys)} 个大内存条目 "
+                        f"(类型: {set(k[2] for k in heavy_keys)})")
 
-    # 处理 subcaches（for-loop 产生的子缓存）
+    # 步骤2: 处理 subcaches
     if hasattr(cache_obj, 'subcaches') and isinstance(cache_obj.subcaches, dict):
         subcache_count = len(cache_obj.subcaches)
+
         if subcache_count > 1:
-            # 只保留最后一个 subcache（当前轮次），清理历史轮次
+            # 清理历史 subcache，只保留最后一个（当前轮次）
             sorted_keys = sorted(cache_obj.subcaches.keys())
             keys_to_remove = sorted_keys[:-1]
             for key in keys_to_remove:
@@ -196,9 +208,9 @@ def _selective_clear_cache(cache_obj, heavy_node_ids, prompt, depth=0):
             if keys_to_remove:
                 logger.info(f"{prefix}[depth={depth}] 清理了 {len(keys_to_remove)}/{subcache_count} 个历史 subcache")
 
-        # 递归清理剩余的 subcache
+        # 步骤3: 递归进入剩余的 subcache
         for subcache_key, subcache in list(cache_obj.subcaches.items()):
-            sub_cleared, sub_total = _selective_clear_cache(subcache, heavy_node_ids, prompt, depth + 1)
+            sub_cleared, sub_total = _recursive_selective_clear(subcache, heavy_types, depth + 1)
             cleared += sub_cleared
             total += sub_total
 
@@ -207,8 +219,9 @@ def _selective_clear_cache(cache_obj, heavy_node_ids, prompt, depth=0):
 
 class LoLolClearCache:
     """
-    透明缓存清理节点（增强版 v4）
-    只清理大内存节点的缓存，保留文件名生成、SetNode 等轻量节点的缓存。
+    透明缓存清理节点（增强版 v5）
+    在每一层缓存中通过 class_type 识别并清理大内存节点，
+    同时清理 for-loop 的历史 subcache。
     """
 
     @classmethod
@@ -237,10 +250,10 @@ class LoLolClearCache:
     RETURN_NAMES = ("output_1", "output_2", "output_3", "output_4", "output_5")
     FUNCTION = "process"
     CATEGORY = "LoLoNodes"
-    DESCRIPTION = "透传节点，只清理大内存节点的执行缓存（VAEDecode、采样器等），保留文件名等轻量缓存。在循环工作流中务必开启 clean_comfy_cache。"
+    DESCRIPTION = "透传节点，在每一层缓存中清理大内存节点（VAEDecode、采样器等），保留轻量节点缓存。在循环工作流中务必开启 clean_comfy_cache。"
 
     def _clear_comfy_execution_cache(self, unique_id, prompt):
-        """选择性清理大内存节点的执行缓存。"""
+        """递归清理所有层级中的大内存节点缓存。"""
         executor = _find_prompt_executor()
         if executor is None:
             logger.warning("[LoLolClearCache] 无法找到 PromptExecutor，跳过执行缓存清理")
@@ -251,19 +264,10 @@ class LoLolClearCache:
 
         try:
             outputs_cache = executor.caches.outputs
-
-            # 从 prompt 中识别大内存节点
-            heavy_node_ids = _get_heavy_node_ids(prompt, DEFAULT_HEAVY_NODE_TYPES)
             logger.info(f"[LoLolClearCache] 缓存类型: {type(outputs_cache).__name__}")
-            logger.info(f"[LoLolClearCache] 识别到 {len(heavy_node_ids)} 个大内存节点需要清理: "
-                       f"{heavy_node_ids}")
 
-            if not heavy_node_ids:
-                logger.info("[LoLolClearCache] 未找到需要清理的大内存节点")
-                return 0
-
-            # 选择性清理
-            cleared, total = _selective_clear_cache(outputs_cache, heavy_node_ids, prompt)
+            # 递归清理所有层级
+            cleared, total = _recursive_selective_clear(outputs_cache, DEFAULT_HEAVY_NODE_TYPES)
 
             if cleared > 0:
                 logger.info(f"[LoLolClearCache] 总计清理 {cleared} 个缓存条目（共 {total} 个）")
@@ -285,7 +289,7 @@ class LoLolClearCache:
             mem_before = _get_mem_info()
             logger.info(f"[LoLolClearCache] 开始清理缓存... 清理前: {mem_before}")
 
-            # 1. 选择性清理 ComfyUI 执行缓存
+            # 1. 清理 ComfyUI 执行缓存
             if clean_comfy_cache:
                 self._clear_comfy_execution_cache(unique_id, prompt)
 
@@ -351,7 +355,7 @@ class LoLolClearCacheWithLabel(LoLolClearCache):
     RETURN_NAMES = ("output_1", "output_2", "output_3", "output_4", "output_5")
     FUNCTION = "process"
     CATEGORY = "LoLoNodes"
-    DESCRIPTION = "透传节点，带自定义标签，只清理大内存节点的执行缓存。"
+    DESCRIPTION = "透传节点，带自定义标签，在每一层缓存中清理大内存节点。"
 
     def process(self, label, clean_cuda, clean_memory, clean_unused_models, clean_comfy_cache=True,
                 unique_id=None, prompt=None, **kwargs):
