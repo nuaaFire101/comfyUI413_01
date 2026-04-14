@@ -2,10 +2,12 @@ import os
 import subprocess
 import tempfile
 import re
+import struct
 import numpy as np
 import torch
 import folder_paths
 from .lolo_ffmpeg_utils import get_ffmpeg_path
+
 
 class LoloVideoCombine:
     @classmethod
@@ -15,12 +17,12 @@ class LoloVideoCombine:
                 "video_dir": ("STRING", {"default": "segments", "multiline": False}),
                 "audio": ("AUDIO",),
                 "filename_prefix": ("STRING", {"default": "combined_video"}),
-                "crossfade_frames": ("INT", {
-                    "default": 4,
+                "blend_frames": ("INT", {
+                    "default": 6,
                     "min": 0,
                     "max": 30,
                     "step": 1,
-                    "tooltip": "相邻片段衔接处的交叉淡入淡出帧数。0=不做crossfade（直接拼接），4~8帧推荐。"
+                    "tooltip": "相邻片段衔接处的帧混合数。两段视频的尾部/头部各取这么多帧做像素级线性混合，实现自然过渡。0=不混合（直接拼接）。推荐4~8帧。"
                 }),
             },
             "optional": {
@@ -44,121 +46,145 @@ class LoloVideoCombine:
         except RuntimeError as e:
             raise RuntimeError(f"节点初始化失败: {e}")
 
-    def _get_video_fps(self, video_path):
-        """用 ffprobe/ffmpeg 获取视频帧率"""
-        try:
-            cmd = [self.ffmpeg_path, "-i", video_path, "-f", "null", "-"]
-            result = subprocess.run(cmd, capture_output=True, text=True, check=False)
-            output = result.stderr
-            fps_match = re.search(r"(\d+(?:\.\d+)?)\s+fps", output)
-            if fps_match:
-                return float(fps_match.group(1))
-        except Exception:
-            pass
-        return 25.0  # 默认帧率
+    def _get_video_info(self, video_path):
+        """获取视频的帧率、宽高"""
+        cmd = [self.ffmpeg_path, "-i", video_path, "-f", "null", "-"]
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        output = result.stderr
 
-    def _get_video_duration(self, video_path):
-        """获取视频时长（秒）"""
-        try:
-            cmd = [self.ffmpeg_path, "-i", video_path, "-f", "null", "-"]
-            result = subprocess.run(cmd, capture_output=True, text=True, check=False)
-            output = result.stderr
-            duration_match = re.search(r"Duration: (\d+):(\d+):([\d.]+)", output)
-            if duration_match:
-                h, m, s = duration_match.groups()
-                return int(h) * 3600 + int(m) * 60 + float(s)
-        except Exception:
-            pass
-        return 0.0
+        fps = 25.0
+        width, height = 0, 0
 
-    def _combine_with_crossfade(self, video_files, crossfade_frames, temp_video):
+        fps_match = re.search(r"(\d+(?:\.\d+)?)\s+fps", output)
+        if fps_match:
+            fps = float(fps_match.group(1))
+
+        # 解析分辨率，如 "736x1024"
+        res_match = re.search(r"(\d{2,5})x(\d{2,5})", output)
+        if res_match:
+            width = int(res_match.group(1))
+            height = int(res_match.group(2))
+
+        return fps, width, height
+
+    def _decode_video_to_frames(self, video_path, width, height):
         """
-        使用 ffmpeg 的 xfade 滤镜逐步拼接视频片段，在衔接处做交叉淡入淡出。
+        用 ffmpeg 将视频解码为 numpy 帧数组。
+        返回: np.ndarray, shape = (num_frames, height, width, 3), dtype=uint8
+        """
+        cmd = [
+            self.ffmpeg_path,
+            "-i", video_path,
+            "-f", "rawvideo",
+            "-pix_fmt", "rgb24",
+            "-v", "error",
+            "-"
+        ]
+        proc = subprocess.run(cmd, capture_output=True)
+        if proc.returncode != 0:
+            raise RuntimeError(f"解码视频失败: {proc.stderr.decode('utf-8', errors='ignore')}")
+
+        raw = proc.stdout
+        frame_size = width * height * 3
+        num_frames = len(raw) // frame_size
+        if num_frames == 0:
+            raise RuntimeError(f"视频解码后无帧: {video_path}")
+
+        frames = np.frombuffer(raw[:num_frames * frame_size], dtype=np.uint8)
+        frames = frames.reshape(num_frames, height, width, 3)
+        return frames
+
+    def _encode_frames_to_video(self, frames, output_path, fps, width, height):
+        """
+        用 ffmpeg 将 numpy 帧数组编码为视频。
+        frames: np.ndarray, shape = (num_frames, height, width, 3), dtype=uint8
+        """
+        cmd = [
+            self.ffmpeg_path,
+            "-y",
+            "-f", "rawvideo",
+            "-vcodec", "rawvideo",
+            "-s", f"{width}x{height}",
+            "-pix_fmt", "rgb24",
+            "-r", str(fps),
+            "-i", "-",
+            "-c:v", "libx264", "-crf", "18", "-preset", "fast",
+            "-pix_fmt", "yuv420p",
+            "-an",
+            output_path
+        ]
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        stdout, stderr = proc.communicate(input=frames.tobytes())
+        if proc.returncode != 0:
+            raise RuntimeError(f"编码视频失败:\n{stderr.decode('utf-8', errors='ignore')}")
+
+    def _combine_with_blend(self, video_files, blend_frames, temp_video):
+        """
+        像素级帧混合拼接。
         
-        原理：
-        - 先获取每段视频的帧率和时长
-        - 用 xfade 滤镜在每两段之间做 crossfade
-        - xfade 的 offset = 第一段视频时长 - crossfade时长
-        - 多段视频需要链式应用 xfade
+        对于相邻的两段视频 A 和 B：
+        - 取 A 的最后 blend_frames 帧
+        - 取 B 的前 blend_frames 帧
+        - 在重叠区域按帧做线性混合：
+            blended[i] = A[i] * (1 - alpha) + B[i] * alpha
+            其中 alpha 从 0 线性增加到 1
+        - 最终序列：A[:-blend] + blended + B[blend:]
+        
+        这比 crossfade（淡入淡出）更自然，因为混合区域的每一帧
+        都同时包含两段的纹理细节，而不是简单的透明度叠加。
         """
-        if len(video_files) < 2:
-            # 只有一个文件，直接复制
-            subprocess.run([self.ffmpeg_path, "-i", video_files[0],
-                           "-c", "copy", "-y", temp_video],
-                          check=True, capture_output=True)
-            return
+        fps, width, height = self._get_video_info(video_files[0])
+        print(f"[LoloVideoCombine] 帧混合模式: {blend_frames}帧, {fps}fps, {width}x{height}")
 
-        fps = self._get_video_fps(video_files[0])
-        crossfade_duration = crossfade_frames / fps
-        print(f"[LoloVideoCombine] Crossfade: {crossfade_frames}帧 = {crossfade_duration:.3f}秒 @ {fps}fps")
+        # 解码所有视频片段
+        all_segments = []
+        for i, vf in enumerate(video_files):
+            frames = self._decode_video_to_frames(vf, width, height)
+            print(f"[LoloVideoCombine]   片段{i}: {frames.shape[0]}帧")
+            all_segments.append(frames)
 
-        # 获取每段视频的时长
-        durations = []
-        for f in video_files:
-            d = self._get_video_duration(f)
-            durations.append(d)
-            print(f"[LoloVideoCombine]   {os.path.basename(f)}: {d:.3f}秒")
+        # 逐步合并
+        result_frames = all_segments[0]
 
-        # 逐步拼接：先拼前两个，再把结果和第三个拼，以此类推
-        # 这样避免 ffmpeg filter_complex 过于复杂
-        current_input = video_files[0]
-        current_duration = durations[0]
-        temp_files = []
+        for i in range(1, len(all_segments)):
+            next_segment = all_segments[i]
 
-        try:
-            for i in range(1, len(video_files)):
-                next_video = video_files[i]
-                next_duration = durations[i]
+            # 确保blend_frames不超过任何一段的帧数
+            actual_blend = min(blend_frames, result_frames.shape[0], next_segment.shape[0])
 
-                # 计算 xfade 的 offset（在第一段结束前 crossfade_duration 秒开始过渡）
-                offset = max(0, current_duration - crossfade_duration)
+            if actual_blend <= 0:
+                # 无法混合，直接拼接
+                result_frames = np.concatenate([result_frames, next_segment], axis=0)
+                continue
 
-                # 创建临时输出
-                with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as tmp:
-                    step_output = tmp.name
-                    temp_files.append(step_output)
+            # 分离各部分
+            head = result_frames[:-actual_blend]          # A的非重叠部分
+            overlap_a = result_frames[-actual_blend:]     # A的重叠帧
+            overlap_b = next_segment[:actual_blend]       # B的重叠帧
+            tail = next_segment[actual_blend:]            # B的非重叠部分
 
-                # 最后一步直接输出到 temp_video
-                if i == len(video_files) - 1:
-                    step_output = temp_video
+            # 逐帧线性混合
+            blended = np.empty_like(overlap_a)
+            for j in range(actual_blend):
+                alpha = (j + 1) / (actual_blend + 1)  # 从接近0到接近1，不包含端点
+                blended[j] = (overlap_a[j].astype(np.float32) * (1 - alpha) +
+                              overlap_b[j].astype(np.float32) * alpha).astype(np.uint8)
 
-                cmd = [
-                    self.ffmpeg_path,
-                    "-i", current_input,
-                    "-i", next_video,
-                    "-filter_complex",
-                    f"[0:v][1:v]xfade=transition=fade:duration={crossfade_duration:.4f}:offset={offset:.4f},format=yuv420p[v]",
-                    "-map", "[v]",
-                    "-c:v", "libx264", "-crf", "18", "-preset", "fast",
-                    "-an",  # 音频后面再加
-                    "-y", step_output
-                ]
+            # 拼合
+            result_frames = np.concatenate([head, blended, tail], axis=0)
 
-                print(f"[LoloVideoCombine] 拼接步骤 {i}/{len(video_files)-1}: "
-                      f"offset={offset:.3f}s, crossfade={crossfade_duration:.3f}s")
+            # 释放已处理的片段
+            del next_segment, overlap_a, overlap_b, blended
 
-                result = subprocess.run(cmd, capture_output=True)
-                if result.returncode != 0:
-                    stderr = result.stderr.decode('utf-8', errors='ignore')
-                    raise RuntimeError(f"xfade 拼接失败 (步骤 {i}):\n{stderr}")
+            print(f"[LoloVideoCombine]   合并片段{i}: 混合{actual_blend}帧, "
+                  f"当前总帧数={result_frames.shape[0]}")
 
-                # 更新当前输入和时长
-                current_input = step_output
-                # xfade 后的时长 = 两段时长之和 - crossfade时长
-                current_duration = current_duration + next_duration - crossfade_duration
+        # 编码为视频
+        print(f"[LoloVideoCombine] 编码最终视频: {result_frames.shape[0]}帧")
+        self._encode_frames_to_video(result_frames, temp_video, fps, width, height)
+        del result_frames
 
-        finally:
-            # 清理中间临时文件（但不清理最后输出的 temp_video）
-            for f in temp_files:
-                if f != temp_video and os.path.exists(f):
-                    try:
-                        os.remove(f)
-                    except Exception:
-                        pass
-
-        print(f"[LoloVideoCombine] Crossfade 拼接完成，总时长: {current_duration:.3f}秒")
-
-    def combine(self, video_dir, audio, filename_prefix, crossfade_frames=4, any=None):
+    def combine(self, video_dir, audio, filename_prefix, blend_frames=6, any=None):
         # ---------- 智能路径解析 ----------
         if not os.path.isabs(video_dir):
             video_dir = os.path.join(folder_paths.get_output_directory(), video_dir)
@@ -191,18 +217,16 @@ class LoloVideoCombine:
         audio_file = None
 
         try:
-            # ---------- 临时无音频视频 ----------
             with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as tmp:
                 temp_video = tmp.name
 
             # ---------- 拼接视频 ----------
-            if crossfade_frames > 0 and len(video_files) > 1:
-                # 使用 crossfade 拼接
-                print(f"[LoloVideoCombine] 使用 crossfade 模式拼接 ({crossfade_frames} 帧过渡)")
-                self._combine_with_crossfade(video_files, crossfade_frames, temp_video)
+            if blend_frames > 0 and len(video_files) > 1:
+                print(f"[LoloVideoCombine] 使用帧混合模式 ({blend_frames}帧重叠混合)")
+                self._combine_with_blend(video_files, blend_frames, temp_video)
             else:
                 # 原有的直接拼接逻辑
-                print(f"[LoloVideoCombine] 使用直接拼接模式（无 crossfade）")
+                print(f"[LoloVideoCombine] 使用直接拼接模式")
                 list_file = None
                 try:
                     with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
@@ -233,7 +257,7 @@ class LoloVideoCombine:
                     if list_file and os.path.exists(list_file):
                         os.remove(list_file)
 
-            # ---------- 处理音频（使用 ffmpeg 直接编码为 wav）----------
+            # ---------- 处理音频 ----------
             waveform = audio["waveform"]
             sample_rate = audio["sample_rate"]
 
